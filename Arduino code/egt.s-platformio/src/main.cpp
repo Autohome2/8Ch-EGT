@@ -23,6 +23,14 @@ HardwareSerial Serial3(USART3); //for some reason this isn't defined in arduino_
 
 enum BitRate { CAN_50KBPS, CAN_100KBPS, CAN_125KBPS, CAN_250KBPS, CAN_500KBPS, CAN_1000KBPS };
 
+BitRate bitRateArray[4] = {
+    CAN_500KBPS,
+    CAN_1000KBPS,
+    CAN_125KBPS,
+    CAN_250KBPS,
+};
+
+
 typedef struct {
     uint16_t id;
     uint8_t  data[8];
@@ -74,12 +82,13 @@ enum IdCan {
 };
 
 enum IdPins {
-    ID_PIN0       = PB3,
-    ID_PIN1       = PB4,
-    ID_PIN2       = PB5,
-    ID_PIN3       = PB6,
-    ID_PIN4       = PB7,
-    CAN_SPEED_PIN = PB8
+    ID_PIN0        = PB3,
+    ID_PIN1        = PB4,
+    ID_PIN2        = PB5,
+    ID_PIN3        = PB6,
+    ID_PIN4        = PB7,
+    CAN_SPEED_PIN1 = PB8,
+    CAN_SPEED_PIN2 = PB9
 };
 
 struct IdAddrCan {
@@ -132,7 +141,8 @@ void canInit(enum BitRate bitrate) {
  }
 
 void setup() {
-    pinMode(CAN_SPEED_PIN, INPUT_PULLUP);
+    pinMode(CAN_SPEED_PIN1, INPUT_PULLUP);
+    pinMode(CAN_SPEED_PIN2, INPUT_PULLUP);
     uint16_t canMask = 0;
     for(uint8_t i = 0; i < ID_CAN_SIZE; ++i) {
         pinMode(pins[i].pin, INPUT_PULLUP);
@@ -142,7 +152,8 @@ void setup() {
     max31855_OK_bits = 0;
     Serial.begin(115200); //debug
     Serial3.begin(115200); //data to speeduino
-    canInit(digitalRead(CAN_SPEED_PIN) ? CAN_500KBPS : CAN_1000KBPS); //init can at 500KBPS speed
+    BitRate canSpeed = bitRateArray[digitalRead(CAN_SPEED_PIN2) <<1 | digitalRead(CAN_SPEED_PIN1)];
+    canInit(canSpeed); //init can at 500KBPS speed
     CAN_msg_14.len = 8; //8 bytes in can message
     CAN_msg_58.len = 8;
     CAN_msg_14.id = Sensor1_4_CAN_ADDRESS | canMask;
