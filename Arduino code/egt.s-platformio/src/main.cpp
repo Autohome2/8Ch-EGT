@@ -116,6 +116,8 @@ void canInit(enum BitRate bitrate) {
     GPIOA->ODR     |= 0x1000UL;
 
     CAN1->MCR = 0x51UL;                       // Set CAN to initialization mode
+
+    while ((CAN1->MSR & CAN_MSR_INAK) == 0U);
      
     // Set bit rates 
     CAN1->BTR &= ~(((0x03) << 24) | ((0x07) << 20) | ((0x0F) << 16) | (0x1FF)); 
@@ -152,12 +154,23 @@ void setup() {
     max31855_OK_bits = 0;
     Serial.begin(115200); //debug
     Serial3.begin(115200); //data to speeduino
-    BitRate canSpeed = bitRateArray[digitalRead(CAN_SPEED_PIN2) <<1 | digitalRead(CAN_SPEED_PIN1)];
+    BitRate canSpeed = bitRateArray[(!digitalRead(CAN_SPEED_PIN2)) << 1 | (!digitalRead(CAN_SPEED_PIN1))];
     canInit(canSpeed); //init can at 500KBPS speed
+    
     CAN_msg_14.len = 8; //8 bytes in can message
     CAN_msg_58.len = 8;
     CAN_msg_14.id = Sensor1_4_CAN_ADDRESS | canMask;
     CAN_msg_58.id = Sensor5_8_CAN_ADDRESS | canMask;
+
+    uint32_t realCanSpeed = 0;
+    switch(canSpeed) {
+        default:
+        case CAN_500KBPS:  realCanSpeed = 500;  break;
+        case CAN_1000KBPS: realCanSpeed = 1000; break;
+        case CAN_125KBPS:  realCanSpeed = 125;  break;
+        case CAN_250KBPS:  realCanSpeed = 250;  break;
+    }
+    Serial.printf("CAN ID 1: 0x%03X CAN ID 2: 0x%03X CanSpeed: %4d\n\r", CAN_msg_14.id, CAN_msg_58.id, realCanSpeed);
 
     // begin communication to MAX31855 chips
     for(uint32_t i = 0; i < 8; ++i) {
@@ -169,14 +182,14 @@ void setup() {
         if (MAX31855_chips[i].readRawData() != 0) {             //we will just get 0 if there is no chip at all.
             if (MAX31855_chips[i].getChipID() != MAX31855_ID)   //if there is something there, check that it responds like MAX31855 (maybe useless step)
             {
-                LOG_D("MAX31855 %d Error\r\n", i+1);
+                LOG_D("MAX31855 %d Error\n\r", i+1);
             }
             else{
                 bitSet(max31855_OK_bits, i);                    //set corresponding bit to 1
             }
         }
         else{
-            LOG_D("Can't find MAX31855 %d\r\n", i+1);           //nothing in this CS line
+            LOG_D("Can't find MAX31855 %d\n\r", i+1);           //nothing in this CS line
         }
     }
 }
@@ -216,35 +229,36 @@ void checkDataRequest() {
 }
 
 
-void canSend(CAN_msg_t* CAN_tx_msg) {
+void  canSend(CAN_msg_t* CAN_tx_msg, uint8_t mbx = 0) {
     volatile uint32_t count = 0;
      
-    CAN1->sTxMailBox[0].TIR   = (CAN_tx_msg->id) << 21;
+    CAN1->sTxMailBox[mbx].TIR   = (CAN_tx_msg->id) << 21;
     
-    CAN1->sTxMailBox[0].TDTR &= ~(0xF);
-    CAN1->sTxMailBox[0].TDTR |= CAN_tx_msg->len & 0xFUL;
+    CAN1->sTxMailBox[mbx].TDTR &= ~(0xF);
+    CAN1->sTxMailBox[mbx].TDTR |= CAN_tx_msg->len & 0xFUL;
     
-    CAN1->sTxMailBox[0].TDLR  = (((uint32_t) CAN_tx_msg->data[3] << 24) |
+    CAN1->sTxMailBox[mbx].TDLR  = (((uint32_t) CAN_tx_msg->data[3] << 24) |
                                  ((uint32_t) CAN_tx_msg->data[2] << 16) |
                                  ((uint32_t) CAN_tx_msg->data[1] <<  8) |
-                                 ((uint32_t) CAN_tx_msg->data[0]      ));
-    CAN1->sTxMailBox[0].TDHR  = (((uint32_t) CAN_tx_msg->data[7] << 24) |
+                                 ((uint32_t) CAN_tx_msg->data[mbx]      ));
+    CAN1->sTxMailBox[mbx].TDHR  = (((uint32_t) CAN_tx_msg->data[7] << 24) |
                                  ((uint32_t) CAN_tx_msg->data[6] << 16) |
                                  ((uint32_t) CAN_tx_msg->data[5] <<  8) |
                                  ((uint32_t) CAN_tx_msg->data[4]      ));
-    CAN1->sTxMailBox[0].TIR  |= 0x1UL;
-    while(CAN1->sTxMailBox[0].TIR & 0x1UL && count++ < 1000000);
+    CAN1->sTxMailBox[mbx].TIR  |= 0x1UL;
+    while(CAN1->sTxMailBox[mbx].TIR & 0x1UL && count++ < 1000000);
             
-    // if (!(CAN1->sTxMailBox[0].TIR & 0x1UL)) return;
+    // if (!(CAN1->sTxMailBox[mbx].TIR & 0x1UL)) return;
      
     //Sends error log to screen
-    if(CAN1->sTxMailBox[0].TIR & 0x1UL) {
-       LOG_D("ESR %5lu MSR %5lu TSR %5lu\r\n", CAN1->ESR, CAN1->MSR, CAN1->TSR);
+    if(CAN1->sTxMailBox[mbx].TIR & 0x1UL) {
+       LOG_D("ESR %5lu MSR %5lu TSR %5lu\n\r", CAN1->ESR, CAN1->MSR, CAN1->TSR);
     }
  }
 
 void loop() {
     static uint32_t egtQueryStamp = 0;
+    static uint32_t secondStamp = 0;
     uint32_t currentTime = millis();
     if((currentTime - egtQueryStamp) > EGT_SPEED) {
         egtQueryStamp = currentTime;
@@ -256,22 +270,22 @@ void loop() {
                     case MAX31855_THERMOCOUPLE_OK:
                         //egt[i]    = (MAX31855_chips[i].getTemperature(rawData[i]));
                         egt[i]    = (rawData[i] >> 18)/4;
-                        LOG_D("Temp: %6d\r\n", egt[i]);
+                        LOG_D("Temp: %6d \n\r", egt[i]);
                         break;
                     case MAX31855_THERMOCOUPLE_SHORT_TO_VCC:
-                        LOG_D("SHORT TO VCC\r\n");
+                        LOG_D("SHORT TO VCC\n\r");
                         egt[i]    = 2000;
                         break;
                     case MAX31855_THERMOCOUPLE_SHORT_TO_GND:
-                        LOG_D("SHORT TO GND\r\n");
+                        LOG_D("SHORT TO GND\n\r");
                         egt[i]    = 3000;
                         break;
                     case MAX31855_THERMOCOUPLE_NOT_CONNECTED:
-                        LOG_D("NOT CONNECTED\r\n");
+                        //LOG_D("NOT CONNECTED\n\r");
                         egt[i]    = 4000;
                         break;
                     default:
-                        LOG_D("MAX31855 ERROR\r\n");
+                        LOG_D("MAX31855 ERROR\n\r");
                         egt[i]    = 5000;
                         break;
                 }
@@ -280,15 +294,15 @@ void loop() {
                 if (i < 4) {
                     CAN_msg_14.data[2*i]   = lowByte ((uint16_t)(egt[i]));
                     CAN_msg_14.data[2*i+1] = highByte((uint16_t)(egt[i]));
-                } else{
+                } else {
                     CAN_msg_58.data[2*i-8] = lowByte ((uint16_t)(egt[i]));
                     CAN_msg_58.data[2*i-7] = highByte((uint16_t)(egt[i]));
                 }
-                LOG_D("Cold Junction %5d \r\n Temp: %6d", i+1, coldJunction[i]);
+                LOG_D("Cold Junction %5d Temp: %6d \n\r", i+1, coldJunction[i]);
             }
         }
-        canSend(&CAN_msg_14);
-        canSend(&CAN_msg_58);
+        canSend(&CAN_msg_14, 0);
+        canSend(&CAN_msg_58, 1);
     }
 
     while(Serial3.available () > 0) {       //is there data on serial3, presumably from speeduino
