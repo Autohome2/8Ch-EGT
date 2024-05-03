@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include "MAX31855.h"
 
-#define DEBUG 1
+//#define DEBUG 1
 
 #ifndef DEBUG
 #define DEBUG 0
@@ -37,20 +37,22 @@ typedef struct {
     uint8_t  len;
 } CAN_msg_t;
 
-typedef const struct {
-    uint8_t TS2;
-    uint8_t TS1;
-    uint8_t BRP;
-} CAN_bit_timing_config_t;
+//typedef const struct {
+//    uint8_t TS2;
+//    uint8_t TS1;
+//    uint8_t BRP;
+//} CAN_bit_timing_config_t;
+//
+//CAN_bit_timing_config_t can_configs[6] = {{2, 13, 45}, {2, 15, 20}, {2, 13, 18}, {2, 13, 9}, {2, 15, 4}, {2, 15, 2}};
 
-CAN_bit_timing_config_t can_configs[6] = {{2, 13, 45}, {2, 15, 20}, {2, 13, 18}, {2, 13, 9}, {2, 15, 4}, {2, 15, 2}};
+
 
 CAN_msg_t CAN_msg_14;        // data from egt 1-4 that will be sent to CAN bus
 CAN_msg_t CAN_msg_58;        // data from egt 5-8 that will be sent to CAN bus
 uint16_t  canAddress;
 uint8_t   canin_channel;
 
-extern CAN_bit_timing_config_t can_configs[6];
+//extern CAN_bit_timing_config_t can_configs[6];
 
 uint8_t cs[8]           = { PA0, PA1, PA2, PA3, PB0, PB1, PB13, PB12 }; //chip select pins for the MAX31855 chips
 int32_t rawData[8]      = { 0 }; //raw data from all 8 MAX31855 chips
@@ -104,6 +106,164 @@ IdAddrCan pins[ID_CAN_SIZE] = {
     { ID_PIN4, 10 },
 };
 
+/* Real speed for bit rate of CAN message                                    */
+uint32_t SPEED[6] = {50*1000, 100*1000, 125*1000, 250*1000, 500*1000, 1000*1000};
+typedef struct
+{
+    uint16_t baud_rate_prescaler;                /// [1 to 1024]
+    uint8_t time_segment_1;                      /// [1 to 16]
+    uint8_t time_segment_2;                      /// [1 to 8]
+    uint8_t resynchronization_jump_width;        /// [1 to 4] (recommended value is 1)
+} CAN_bit_timing_config_t;
+
+#define CAN_STM32_ERROR_UNSUPPORTED_BIT_RATE     1000
+#define CAN_STM32_ERROR_MSR_INAK_NOT_SET         1001
+#define CAN_STM32_ERROR_MSR_INAK_NOT_CLEARED     1002
+#define CAN_STM32_ERROR_UNSUPPORTED_FRAME_FORMAT 1003
+
+/*
+ * Calculation of bit timing dependent on peripheral clock rate
+ */
+int16_t ComputeCANTimings(const uint32_t peripheral_clock_rate,
+                          const uint32_t target_bitrate,
+                          CAN_bit_timing_config_t* out_timings)
+{
+    if (target_bitrate < 1000)
+    {
+        return -CAN_STM32_ERROR_UNSUPPORTED_BIT_RATE;
+    }
+
+    //assert(out_timings != NULL);  // NOLINT
+    memset(out_timings, 0, sizeof(*out_timings));
+
+    /*
+     * Hardware configuration
+     */
+    static const uint8_t MaxBS1 = 16;
+    static const uint8_t MaxBS2 = 8;
+
+    /*
+     * Ref. "Automatic Baudrate Detection in CANopen Networks", U. Koppe, MicroControl GmbH & Co. KG
+     *      CAN in Automation, 2003
+     *
+     * According to the source, optimal quanta per bit are:
+     *   Bitrate        Optimal Maximum
+     *   1000 kbps      8       10
+     *   500  kbps      16      17
+     *   250  kbps      16      17
+     *   125  kbps      16      17
+     */
+    const uint8_t max_quanta_per_bit = (uint8_t)((target_bitrate >= 1000000) ? 10 : 17);    // NOLINT
+    //assert(max_quanta_per_bit <= (MaxBS1 + MaxBS2));
+
+    static const uint16_t MaxSamplePointLocationPermill = 900;
+
+    /*
+     * Computing (prescaler * BS):
+     *   BITRATE = 1 / (PRESCALER * (1 / PCLK) * (1 + BS1 + BS2))       -- See the Reference Manual
+     *   BITRATE = PCLK / (PRESCALER * (1 + BS1 + BS2))                 -- Simplified
+     * let:
+     *   BS = 1 + BS1 + BS2                                             -- Number of time quanta per bit
+     *   PRESCALER_BS = PRESCALER * BS
+     * ==>
+     *   PRESCALER_BS = PCLK / BITRATE
+     */
+    const uint32_t prescaler_bs = peripheral_clock_rate / target_bitrate;
+
+    /*
+     * Searching for such prescaler value so that the number of quanta per bit is highest.
+     */
+    uint8_t bs1_bs2_sum = (uint8_t)(max_quanta_per_bit - 1);    // NOLINT
+
+    while ((prescaler_bs % (1U + bs1_bs2_sum)) != 0)
+    {
+        if (bs1_bs2_sum <= 2)
+        {
+            return -CAN_STM32_ERROR_UNSUPPORTED_BIT_RATE;          // No solution
+        }
+        bs1_bs2_sum--;
+    }
+
+    const uint32_t prescaler = prescaler_bs / (1U + bs1_bs2_sum);
+    if ((prescaler < 1U) || (prescaler > 1024U))
+    {
+        return -CAN_STM32_ERROR_UNSUPPORTED_BIT_RATE;              // No solution
+    }
+
+    /*
+     * Now we have a constraint: (BS1 + BS2) == bs1_bs2_sum.
+     * We need to find such values so that the sample point is as close as possible to the optimal value,
+     * which is 87.5%, which is 7/8.
+     *
+     *   Solve[(1 + bs1)/(1 + bs1 + bs2) == 7/8, bs2]  (* Where 7/8 is 0.875, the recommended sample point location *)
+     *   {{bs2 -> (1 + bs1)/7}}
+     *
+     * Hence:
+     *   bs2 = (1 + bs1) / 7
+     *   bs1 = (7 * bs1_bs2_sum - 1) / 8
+     *
+     * Sample point location can be computed as follows:
+     *   Sample point location = (1 + bs1) / (1 + bs1 + bs2)
+     *
+     * Since the optimal solution is so close to the maximum, we prepare two solutions, and then pick the best one:
+     *   - With rounding to nearest
+     *   - With rounding to zero
+     */
+    uint8_t bs1 = (uint8_t)(((7 * bs1_bs2_sum - 1) + 4) / 8);       // Trying rounding to nearest first  // NOLINT
+    uint8_t bs2 = (uint8_t)(bs1_bs2_sum - bs1);  // NOLINT
+    //assert(bs1_bs2_sum > bs1);
+
+    {
+        const uint16_t sample_point_permill = (uint16_t)(1000U * (1U + bs1) / (1U + bs1 + bs2));  // NOLINT
+
+        if (sample_point_permill > MaxSamplePointLocationPermill)   // Strictly more!
+        {
+            bs1 = (uint8_t)((7 * bs1_bs2_sum - 1) / 8);             // Nope, too far; now rounding to zero
+            bs2 = (uint8_t)(bs1_bs2_sum - bs1);
+        }
+    }
+
+    const bool valid = (bs1 >= 1) && (bs1 <= MaxBS1) && (bs2 >= 1) && (bs2 <= MaxBS2);
+
+    /*
+     * Final validation
+     * Helpful Python:
+     * def sample_point_from_btr(x):
+     *     assert 0b0011110010000000111111000000000 & x == 0
+     *     ts2,ts1,brp = (x>>20)&7, (x>>16)&15, x&511
+     *     return (1+ts1+1)/(1+ts1+1+ts2+1)
+     */
+    if ((target_bitrate != (peripheral_clock_rate / (prescaler * (1U + bs1 + bs2)))) ||
+        !valid)
+    {
+        // This actually means that the algorithm has a logic error, hence assert(0).
+        //assert(0);  // NOLINT
+        return -CAN_STM32_ERROR_UNSUPPORTED_BIT_RATE;
+    }
+
+    out_timings->baud_rate_prescaler = (uint16_t) prescaler;
+    out_timings->resynchronization_jump_width = 1;      // One is recommended by UAVCAN, CANOpen, and DeviceNet
+    out_timings->time_segment_1 = bs1;
+    out_timings->time_segment_2 = bs2;
+
+    if (DEBUG) {
+      Serial.print("target_bitrate=");
+      Serial.println(target_bitrate);
+      Serial.print("peripheral_clock_rate=");
+      Serial.println(peripheral_clock_rate);
+  
+      Serial.print("timings.baud_rate_prescaler=");
+      Serial.println(out_timings->baud_rate_prescaler);
+      Serial.print("timings.time_segment_1=");
+      Serial.println(out_timings->time_segment_1);
+      Serial.print("timings.time_segment_2=");
+      Serial.println(out_timings->time_segment_2);
+      Serial.print("timings.resynchronization_jump_width=");
+      Serial.println(out_timings->resynchronization_jump_width);
+    }
+    return 0;
+}
+
 void canInit(enum BitRate bitrate) {
     RCC->APB1ENR   |= 0x2000000UL;            // Enable CAN clock 
     RCC->APB2ENR   |= 0x1UL;                  // Enable AFIO clock
@@ -113,15 +273,29 @@ void canInit(enum BitRate bitrate) {
     RCC->APB2ENR   |= 0x4UL;                  // Enable GPIOA clock (bit2 to 1)
     GPIOA->CRH     &= 0xFFF00FFF;
     GPIOA->CRH     |= 0xB8000UL;              // Configure PA11 and PA12
-    GPIOA->ODR     |= 0x1000UL;
+    GPIOA->ODR     |= 0x1800UL;
 
     CAN1->MCR = 0x51UL;                       // Set CAN to initialization mode
 
     while ((CAN1->MSR & CAN_MSR_INAK) == 0U);
      
-    // Set bit rates 
-    CAN1->BTR &= ~(((0x03) << 24) | ((0x07) << 20) | ((0x0F) << 16) | (0x1FF)); 
-    CAN1->BTR |=  (((can_configs[bitrate].TS2-1) & 0x07) << 20) | (((can_configs[bitrate].TS1-1) & 0x0F) << 16) | ((can_configs[bitrate].BRP-1) & 0x1FF);
+
+    CAN_bit_timing_config_t timings;
+    Serial.print("bitrate=");
+    Serial.println(bitrate);
+    uint32_t target_bitrate = SPEED[bitrate];
+    Serial.print("target_bitrate=");
+    Serial.println(target_bitrate);
+    int result = ComputeCANTimings(HAL_RCC_GetPCLK1Freq(), target_bitrate, &timings);
+    if (result) while(true);  
+    CAN1->BTR = (((timings.resynchronization_jump_width - 1U) &    3U) << 24U) |
+              (((timings.time_segment_1 - 1U)               &   15U) << 16U) |
+              (((timings.time_segment_2 - 1U)               &    7U) << 20U) |
+              ((timings.baud_rate_prescaler - 1U)           & 1023U);
+  
+    //// Set bit rates 
+    //CAN1->BTR &= ~(((0x03) << 24) | ((0x07) << 20) | ((0x0F) << 16) | (0x1FF)); 
+    //CAN1->BTR |=  (((can_configs[bitrate].TS2-1) & 0x07) << 20) | (((can_configs[bitrate].TS1-1) & 0x0F) << 16) | ((can_configs[bitrate].BRP-1) & 0x1FF);
 
     // Configure Filters to default values
     CAN1->FMR    |=     0x1UL;                // Set to filter initialization mode
@@ -232,6 +406,7 @@ void checkDataRequest() {
 void  canSend(CAN_msg_t* CAN_tx_msg, uint8_t mbx = 0) {
     volatile uint32_t count = 0;
      
+    CAN1->sTxMailBox[mbx].TIR   = 0; 
     CAN1->sTxMailBox[mbx].TIR   = (CAN_tx_msg->id) << 21;
     
     CAN1->sTxMailBox[mbx].TDTR &= ~(0xF);
@@ -269,7 +444,7 @@ void loop() {
                 switch(MAX31855_chips[i].detectThermocouple(rawData[i])) {
                     case MAX31855_THERMOCOUPLE_OK:
                         //egt[i]    = (MAX31855_chips[i].getTemperature(rawData[i]));
-                        egt[i]    = (rawData[i] >> 18)/4;
+                        egt[i]    = (rawData[i] >> 20);
                         LOG_D("Temp: %6d \n\r", egt[i]);
                         break;
                     case MAX31855_THERMOCOUPLE_SHORT_TO_VCC:
